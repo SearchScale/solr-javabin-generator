@@ -25,6 +25,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BiConsumer;
 import java.util.zip.GZIPInputStream;
 
 import org.apache.solr.common.MapWriter;
@@ -294,42 +295,43 @@ public class Indexer {
   private static long processBatch(Params p, int batchIndex, long startIndex, int batchSize) throws Exception {
     String name = Paths.get(p.outputDir, "batch." + batchIndex).toString();
     
-    // Read only the vectors needed for this batch
-    List<float[]> vectors = new ArrayList<>();
-    FBIvecsReader.ReadResult readResult = FBIvecsReader.readFvecsRangeWithMetrics(p.dataFile, (int) startIndex, batchSize, vectors);
-    
+    // Use streaming approach instead of loading all vectors into memory
     try (FileOutputStream os = new FileOutputStream(name)) {
       JavaBinCodec codec = new J(os);
       codec.writeTag(ITERATOR);
       
-      for (int i = 0; i < vectors.size(); i++) {
-        float[] vector = vectors.get(i);
-        final int docId = (int) (startIndex + i);
-        final float[] vectorData = vector;
-        
-        MapWriter d = ew -> {
-          ew.put("id", String.valueOf(docId));
-          if (p.isLegacy) {
-            // Convert float[] to List<Float> for legacy mode
-            List<Float> floatList = new ArrayList<>();
-            for (float f : vectorData) {
-              floatList.add(f);
+      // Stream vectors directly from file to JavaBin output
+      long bytesRead = FBIvecsReader.streamFvecsRange(p.dataFile, (int) startIndex, batchSize, (vector, index) -> {
+        try {
+          final int docId = (int) (startIndex + index);
+          final float[] vectorData = vector;
+          
+          MapWriter d = ew -> {
+            ew.put("id", String.valueOf(docId));
+            if (p.isLegacy) {
+              // Convert float[] to List<Float> for legacy mode
+              List<Float> floatList = new ArrayList<>();
+              for (float f : vectorData) {
+                floatList.add(f);
+              }
+              ew.put("article_vector", floatList);
+            } else {
+              ew.put("article_vector", vectorData);
             }
-            ew.put("article_vector", floatList);
-          } else {
-            ew.put("article_vector", vectorData);
-          }
-        };
-        
-        codec.writeMap(d);
-      }
+          };
+          
+          codec.writeMap(d);
+        } catch (IOException e) {
+          throw new RuntimeException("Error writing vector to JavaBin", e);
+        }
+      });
       
       codec.writeTag(END);
       codec.close();
       System.out.println(name);
+      
+      return bytesRead;
     }
-    
-    return readResult.bytesRead;
   }
 
   // Class to hold processing results
@@ -348,48 +350,51 @@ public class Indexer {
     
     String name = Paths.get(p.outputDir, "batch." + chunkIndex).toString();
     
-    // Read vectors from this chunk
+    // Use streaming approach for chunks as well
     long readStart = System.currentTimeMillis();
-    List<float[]> vectors = new ArrayList<>();
-    long bytesRead = FBIvecsReader.readFvecsChunk(p.dataFile, chunk, vectors);
-    long readTime = System.currentTimeMillis() - readStart;
+    final AtomicInteger vectorCount = new AtomicInteger(0);
     
-    long writeStart = System.currentTimeMillis();
     try (FileOutputStream os = new FileOutputStream(name)) {
       JavaBinCodec codec = new J(os);
       codec.writeTag(ITERATOR);
       
-      for (int i = 0; i < vectors.size(); i++) {
-        float[] vector = vectors.get(i);
-        final int docId = chunk.startVectorIndex + i;
-        final float[] vectorData = vector;
-        
-        MapWriter d = ew -> {
-          ew.put("id", String.valueOf(docId));
-          if (p.isLegacy) {
-            // Convert float[] to List<Float> for legacy mode
-            List<Float> floatList = new ArrayList<>();
-            for (float f : vectorData) {
-              floatList.add(f);
+      // Stream vectors directly from chunk to JavaBin output
+      long bytesRead = FBIvecsReader.streamFvecsChunk(p.dataFile, chunk, (vector, index) -> {
+        try {
+          final int docId = chunk.startVectorIndex + index;
+          final float[] vectorData = vector;
+          
+          MapWriter d = ew -> {
+            ew.put("id", String.valueOf(docId));
+            if (p.isLegacy) {
+              // Convert float[] to List<Float> for legacy mode
+              List<Float> floatList = new ArrayList<>();
+              for (float f : vectorData) {
+                floatList.add(f);
+              }
+              ew.put("article_vector", floatList);
+            } else {
+              ew.put("article_vector", vectorData);
             }
-            ew.put("article_vector", floatList);
-          } else {
-            ew.put("article_vector", vectorData);
-          }
-        };
-        
-        codec.writeMap(d);
-      }
+          };
+          
+          codec.writeMap(d);
+          vectorCount.incrementAndGet();
+        } catch (IOException e) {
+          throw new RuntimeException("Error writing vector to JavaBin", e);
+        }
+      });
       
       codec.writeTag(END);
       codec.close();
+      
+      long readTime = System.currentTimeMillis() - readStart;
+      long totalTime = System.currentTimeMillis() - chunkStart;
+      
+      System.out.println(name + " (" + vectorCount.get() + " documents, " + bytesRead + " bytes read)");
+      
+      return new ChunkProcessingResult(vectorCount.get(), bytesRead);
     }
-    long writeTime = System.currentTimeMillis() - writeStart;
-    long totalTime = System.currentTimeMillis() - chunkStart;
-    
-    System.out.println(name + " (" + vectors.size() + " documents, " + bytesRead + " bytes read)");
-    
-    return new ChunkProcessingResult(vectors.size(), bytesRead);
   }
 
   private static boolean writeBatch(long docsCount, BufferedReader br, JavaBinCodec codec, boolean legacy)

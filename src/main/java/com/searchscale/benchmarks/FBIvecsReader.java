@@ -10,6 +10,7 @@ import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.BiConsumer;
 import java.util.zip.GZIPInputStream;
 
 import org.slf4j.Logger;
@@ -424,6 +425,153 @@ public class FBIvecsReader {
     } catch (Exception e) {
       long totalTime = System.currentTimeMillis() - methodStart;
       log.error("Error reading chunk from file: {} (after {}ms)", filePath, totalTime, e);
+      e.printStackTrace();
+    }
+    
+    return totalBytesRead;
+  }
+
+  /**
+   * Stream vectors from a specific range without loading them all into memory
+   * @param filePath Path to the .fbin file
+   * @param startIndex Starting vector index
+   * @param count Number of vectors to read
+   * @param consumer BiConsumer that processes each vector as it's read (vector, index)
+   * @return Total bytes read from file
+   */
+  public static long streamFvecsRange(String filePath, int startIndex, int count, BiConsumer<float[], Integer> consumer) {
+    long totalBytesRead = 0;
+    try {
+      if (filePath.endsWith(".fbin")) {
+        FileChannel channel = FileChannel.open(Paths.get(filePath), StandardOpenOption.READ);
+        
+        // Read header
+        ByteBuffer headerBuffer = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN);
+        channel.position(0);
+        channel.read(headerBuffer);
+        headerBuffer.flip();
+        int totalCount = headerBuffer.getInt();
+        int dimension = headerBuffer.getInt();
+        totalBytesRead += 8;
+        
+        if (dimension <= 0 || dimension > 10000) {
+          log.warn("Invalid dimension: {}", dimension);
+          channel.close();
+          return totalBytesRead;
+        }
+        
+        // Calculate position for the range
+        long startByteOffset = 8 + ((long) startIndex * dimension * 4L);
+        channel.position(startByteOffset);
+        
+        // Read and process vectors one by one
+        ByteBuffer vectorBuffer = ByteBuffer.allocate(dimension * 4).order(ByteOrder.LITTLE_ENDIAN);
+        
+        for (int i = 0; i < count && (startIndex + i) < totalCount; i++) {
+          vectorBuffer.clear();
+          int bytesRead = channel.read(vectorBuffer);
+          if (bytesRead != dimension * 4) {
+            break; // Reached end of file
+          }
+          totalBytesRead += bytesRead;
+          vectorBuffer.flip();
+          
+          float[] vector = new float[dimension];
+          for (int j = 0; j < dimension; j++) {
+            vector[j] = vectorBuffer.getFloat();
+          }
+          
+          // Process this vector immediately
+          consumer.accept(vector, i);
+        }
+        
+        channel.close();
+      } else {
+        log.error("Streaming is currently only supported for .fbin format");
+        throw new UnsupportedOperationException("Streaming only supported for .fbin format");
+      }
+    } catch (Exception e) {
+      log.error("Error streaming range [{}, {}] from file: {}", startIndex, startIndex + count - 1, filePath, e);
+      e.printStackTrace();
+    }
+    
+    return totalBytesRead;
+  }
+
+  /**
+   * Stream vectors from a file chunk without loading them all into memory
+   * @param filePath Path to the .fbin file
+   * @param chunkObj FileChunk object containing chunk metadata
+   * @param consumer BiConsumer that processes each vector as it's read (vector, index)
+   * @return Total bytes read from file
+   */
+  public static long streamFvecsChunk(String filePath, Object chunkObj, BiConsumer<float[], Integer> consumer) {
+    long totalBytesRead = 0;
+    
+    try {
+      // Get chunk properties using reflection
+      Class<?> chunkClass = chunkObj.getClass();
+      long startByteOffset = (Long) chunkClass.getField("startByteOffset").get(chunkObj);
+      long endByteOffset = (Long) chunkClass.getField("endByteOffset").get(chunkObj);
+      int startVectorIndex = (Integer) chunkClass.getField("startVectorIndex").get(chunkObj);
+      
+      FileChannel channel = FileChannel.open(Paths.get(filePath), StandardOpenOption.READ);
+      
+      if (filePath.endsWith(".fbin")) {
+        // Read header for dimension
+        ByteBuffer headerBuffer = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN);
+        channel.position(0);
+        channel.read(headerBuffer);
+        headerBuffer.flip();
+        int totalCount = headerBuffer.getInt();
+        int dimension = headerBuffer.getInt();
+        totalBytesRead += 8;
+        
+        if (dimension <= 0 || dimension > 10000) {
+          log.warn("Invalid dimension: {}", dimension);
+          channel.close();
+          return totalBytesRead;
+        }
+        
+        // Process vectors in the chunk one by one
+        channel.position(startByteOffset);
+        ByteBuffer vectorBuffer = ByteBuffer.allocate(dimension * 4).order(ByteOrder.LITTLE_ENDIAN);
+        
+        int vectorIndex = 0;
+        long currentPosition = startByteOffset;
+        
+        while (currentPosition < endByteOffset) {
+          vectorBuffer.clear();
+          int bytesRead = channel.read(vectorBuffer);
+          if (bytesRead != dimension * 4) {
+            break; // Incomplete vector, stop reading
+          }
+          totalBytesRead += bytesRead;
+          currentPosition += bytesRead;
+          vectorBuffer.flip();
+          
+          float[] vector = new float[dimension];
+          for (int j = 0; j < dimension; j++) {
+            vector[j] = vectorBuffer.getFloat();
+          }
+          
+          // Process this vector immediately
+          consumer.accept(vector, vectorIndex);
+          vectorIndex++;
+          
+          if ((startVectorIndex + vectorIndex) % 1000 == 0) {
+            System.out.print(".");
+          }
+        }
+        
+        channel.close();
+      } else {
+        log.error("Chunk streaming is currently only supported for .fbin format");
+        throw new UnsupportedOperationException("Chunk streaming only supported for .fbin format");
+      }
+      
+    } catch (Exception e) {
+      log.error("Error streaming chunk from file: {}", filePath, e);
       e.printStackTrace();
     }
     
