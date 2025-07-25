@@ -1,54 +1,44 @@
-# JavaBin Solr Integration Test
+# Solr JavaBin Generator
 
-This integration test verifies the JavaBin generation and upload functionality with Solr 9.9 using Solr's test framework.
+A high-performance tool for generating and uploading JavaBin batch files to Apache Solr for vector search workloads.
 
 ## Prerequisites
 
 - Maven 3.6+ 
 - Java 17+
 
-## Running the Integration Test
+## Build
 
-To run the integration test:
+To build the project:
 
 ```bash
-mvn clean verify
+mvn clean package
 ```
 
-This will:
-1. Compile the project
-2. Run unit tests
-3. Run the integration test which:
-   - Generates a small sample test data file (100 vectors, 768 dimensions)
-   - Starts a MiniSolrCloudCluster (embedded Solr instance)
-   - Generates JavaBin batch files from the test data
-   - Uploads the configset from `src/test/resources/solr-configset/` directory
-   - Creates a test collection
-   - Uploads the JavaBin batches to Solr
-   - Verifies that the correct number of documents were indexed
+This creates an executable JAR with all dependencies: `target/javabin-generator-1.0-SNAPSHOT-jar-with-dependencies.jar`
 
-## Test Configuration
+## Performance Benchmark
 
-The test is configured to:
-- Generate and process 100 test vectors
-- Create batches of 25 documents each
-- Use vector dimension of 768 (as defined in schema.xml)
-- Run using Solr's MiniSolrCloudCluster with 1 node
+To run a performance benchmark comparing single-threaded vs multi-threaded processing:
 
-## Test Framework
+**Prerequisites**: Download the 1M Wikipedia dataset first:
+```bash
+wget https://data.rapids.ai/raft/datasets/wiki_all_1M/wiki_all_1M.tar
+tar -xf wiki_all_1M.tar
+```
 
-The test uses:
-- `solr-test-framework`: Solr's official test framework
-- `SolrCloudTestCase`: Base class for Solr Cloud tests
-- `MiniSolrCloudCluster`: Embedded Solr cluster for testing
+**Run the benchmark**:
+```bash
+mvn clean package
+java -cp target/javabin-generator-1.0-SNAPSHOT-jar-with-dependencies.jar com.searchscale.benchmarks.PerformanceBenchmark
+```
 
-## Troubleshooting
-
-If the test fails:
-1. Check the test logs for detailed error messages
-2. Ensure the configset files exist in `src/test/resources/solr-configset/` directory
-3. Check that temporary directories can be created
-4. Verify Java 17+ is being used
+This benchmark:
+- Processes 500,000 vectors from the 1M Wikipedia dataset (requires `base.1M.fbin`)
+- Creates 20 batch files with 25,000 documents each
+- Compares single-threaded vs multi-threaded performance
+- Verifies data integrity between both outputs
+- Reports throughput, speedup, and processing times
 
 ## Using Real Datasets
 
@@ -65,8 +55,11 @@ java -jar target/javabin-generator-1.0-SNAPSHOT-jar-with-dependencies.jar data_f
 
 **Performance**: Using `threads=all` or `threads=4` can improve performance significantly (~80% faster) for large datasets.
 
-### Parameters
+## Customization
 
+You can customize the JavaBin generation by modifying the command-line parameters or the source code:
+
+### Command-line Parameters
 - `data_file`: Path to the .fbin/.fvecs input file
 - `output_dir`: Directory where JavaBin batch files will be created
 - `batch_size`: Number of documents per batch file (default: 1000)
@@ -75,9 +68,8 @@ java -jar target/javabin-generator-1.0-SNAPSHOT-jar-with-dependencies.jar data_f
 - `threads`: Number of parallel threads for processing (default: 1, use `all` for all available processors)
 - `overwrite`: Delete existing files in output directory before processing (default: false)
 
-## Customization
-
-To test with different parameters, modify these constants in `JavaBinSolrIT.java`:
+### Source Code Customization
+For integration test parameters, modify these constants in `JavaBinSolrIT.java`:
 - `VECTOR_COUNT`: Number of vectors to generate and process
 - `BATCH_SIZE`: Number of documents per batch file
 - `VECTOR_DIMENSION`: Dimension of the generated vectors

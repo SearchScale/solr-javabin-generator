@@ -182,63 +182,7 @@ public class Indexer {
   }
 
   private static void processFvecFile(Params p, long docsCount, long batchSz) throws Exception {
-    if (p.threads <= 1) {
-      // Single-threaded processing (original logic)
-      processFvecFileSingleThreaded(p, docsCount, batchSz);
-    } else {
-      // Multi-threaded processing
-      processFvecFileMultiThreaded(p, docsCount, batchSz);
-    }
-  }
-
-  private static void processFvecFileSingleThreaded(Params p, long docsCount, long batchSz) throws Exception {
-    List<float[]> vectors = new ArrayList<>();
-    
-    // Read all vectors from the fvec file
-    FBIvecsReader.readFvecs(p.dataFile, (int) docsCount, vectors);
-    
-    int totalProcessed = 0;
-    int batchIndex = 0;
-    
-    while (totalProcessed < vectors.size() && totalProcessed < docsCount) {
-      String name = Paths.get(p.outputDir, "batch." + batchIndex).toString();
-      try (FileOutputStream os = new FileOutputStream(name)) {
-        JavaBinCodec codec = new J(os);
-        int batchCount = 0;
-        
-        codec.writeTag(ITERATOR);
-        
-        while (batchCount < batchSz && totalProcessed < vectors.size() && totalProcessed < docsCount) {
-          float[] vector = vectors.get(totalProcessed);
-          
-          // Create a document with id and vector
-          final int docId = totalProcessed;
-          final float[] vectorData = vector;
-          MapWriter d = ew -> {
-            ew.put("id", String.valueOf(docId));
-            if (p.isLegacy) {
-              // Convert float[] to List<Float> for legacy mode
-              List<Float> floatList = new ArrayList<>();
-              for (float f : vectorData) {
-                floatList.add(f);
-              }
-              ew.put("article_vector", floatList);
-            } else {
-              ew.put("article_vector", vectorData);
-            }
-          };
-          
-          codec.writeMap(d);
-          batchCount++;
-          totalProcessed++;
-        }
-        
-        codec.writeTag(END);
-        codec.close();
-        System.out.println(name);
-        batchIndex++;
-      }
-    }
+    processFvecFileMultiThreaded(p, docsCount, batchSz);
   }
 
   private static void processFvecFileMultiThreaded(Params p, long docsCount, long batchSz) throws Exception {
