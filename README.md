@@ -17,30 +17,7 @@ mvn clean package
 
 This creates an executable JAR with all dependencies: `target/javabin-generator-1.0-SNAPSHOT-jar-with-dependencies.jar`
 
-## Performance Benchmark
-
-To run a performance benchmark comparing single-threaded vs multi-threaded processing:
-
-**Prerequisites**: Download the 1M Wikipedia dataset first:
-```bash
-wget https://data.rapids.ai/raft/datasets/wiki_all_1M/wiki_all_1M.tar
-tar -xf wiki_all_1M.tar
-```
-
-**Run the benchmark**:
-```bash
-mvn clean package
-java -cp target/javabin-generator-1.0-SNAPSHOT-jar-with-dependencies.jar com.searchscale.benchmarks.PerformanceBenchmark
-```
-
-This benchmark:
-- Processes 500,000 vectors from the 1M Wikipedia dataset (requires `base.1M.fbin`)
-- Creates 20 batch files with 25,000 documents each
-- Compares single-threaded vs multi-threaded performance
-- Verifies data integrity between both outputs
-- Reports throughput, speedup, and processing times
-
-## Using Real Datasets
+## Usage
 
 ### Example: 1M Wikipedia Vectors from NVIDIA
 
@@ -68,8 +45,18 @@ You can customize the JavaBin generation by modifying the command-line parameter
 - `threads`: Number of parallel threads for processing (default: 1, use `all` for all available processors)
 - `overwrite`: Delete existing files in output directory before processing (default: false)
 
-### Source Code Customization
-For integration test parameters, modify these constants in `JavaBinSolrIT.java`:
-- `VECTOR_COUNT`: Number of vectors to generate and process
-- `BATCH_SIZE`: Number of documents per batch file
-- `VECTOR_DIMENSION`: Dimension of the generated vectors
+## Performance Benchmark
+
+To run a performance benchmark comparing single-threaded vs multi-threaded processing:
+
+**Prerequisites**: Download the 1M Wikipedia dataset first:
+```bash
+wget https://data.rapids.ai/raft/datasets/wiki_all_1M/wiki_all_1M.tar
+tar -xf wiki_all_1M.tar
+```
+
+**Run the benchmark**:
+```bash
+mvn clean package
+java -cp target/javabin-generator-1.0-SNAPSHOT-jar-with-dependencies.jar com.searchscale.benchmarks.PerformanceBenchmark file=base.1M.fbin total_docs=50000 batch_size=2500
+```
