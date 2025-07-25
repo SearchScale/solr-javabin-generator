@@ -13,9 +13,9 @@ import java.util.Arrays;
 public class PerformanceBenchmark {
     
     private static final String FBIN_FILE = "base.1M.fbin";
-    private static final int BATCH_SIZE = 2500;
-    private static final int TOTAL_DOCS = 25000; // 10 batches of 2.5k each
-    private static final int NUM_BATCHES = 10;
+    private static final int BATCH_SIZE = 25000;
+    private static final int TOTAL_DOCS = 500000; // 20 batches of 25k each
+    private static final int NUM_BATCHES = 20;
     
     public static void main(String[] args) throws Exception {
         System.out.println("=".repeat(80));
