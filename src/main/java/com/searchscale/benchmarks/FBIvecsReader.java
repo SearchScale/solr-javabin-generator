@@ -5,6 +5,9 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.channels.FileChannel;
+import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.zip.GZIPInputStream;
@@ -213,68 +216,82 @@ public class FBIvecsReader {
     }
   }
 
+  // Result class for returning both vectors and bytes read
+  public static class ReadResult {
+    public final long bytesRead;
+    
+    public ReadResult(long bytesRead) {
+      this.bytesRead = bytesRead;
+    }
+  }
+  
   /**
    * Read a specific range of vectors from an fbin file for parallel processing
    */
   public static void readFvecsRange(String filePath, int startIndex, int count, List<float[]> vectors) {
+    readFvecsRangeWithMetrics(filePath, startIndex, count, vectors);
+  }
+  
+  /**
+   * Read a specific range of vectors from an fbin file and return metrics
+   */
+  public static ReadResult readFvecsRangeWithMetrics(String filePath, int startIndex, int count, List<float[]> vectors) {
+    long totalBytesRead = 0;
     try {
-      InputStream is = new FileInputStream(filePath);
-      
       if (filePath.endsWith(".fbin")) {
-        // Read header
-        int totalCount = getDimension(is);
-        int dimension = getDimension(is);
+        // Use optimized NIO approach similar to chunked reading
+        FileChannel channel = FileChannel.open(Paths.get(filePath), StandardOpenOption.READ);
+        
+        // Read header efficiently
+        ByteBuffer headerBuffer = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN);
+        channel.position(0);
+        channel.read(headerBuffer);
+        headerBuffer.flip();
+        int totalCount = headerBuffer.getInt();
+        int dimension = headerBuffer.getInt();
+        totalBytesRead += 8;
         
         if (dimension <= 0 || dimension > 10000) {
           log.warn("Invalid dimension: {}", dimension);
-          return;
+          channel.close();
+          return new ReadResult(totalBytesRead);
         }
         
-        // Skip to the start index
-        long bytesToSkip = (long) startIndex * dimension * 4L; // 4 bytes per float
-        long skipped = is.skip(bytesToSkip);
-        if (skipped != bytesToSkip) {
-          // Handle case where skip didn't work as expected
-          is.close();
-          is = new FileInputStream(filePath);
-          getDimension(is); // Skip total count
-          getDimension(is); // Skip dimension
-          
-          // Skip vectors one by one if skip() doesn't work
-          for (int i = 0; i < startIndex; i++) {
-            for (int j = 0; j < dimension; j++) {
-              is.readNBytes(4); // Skip each float
-            }
-          }
-        }
+        // Calculate byte positions for the range we want to read
+        long startByteOffset = 8 + ((long) startIndex * dimension * 4L); // Header + vector data offset
+        long dataSize = (long) count * dimension * 4L; // Size of data to read
         
-        // Read the requested range
+        // Bulk read the entire range in one operation
+        ByteBuffer rangeBuffer = ByteBuffer.allocate((int)dataSize).order(ByteOrder.LITTLE_ENDIAN);
+        channel.position(startByteOffset);
+        int bytesRead = channel.read(rangeBuffer);
+        totalBytesRead += bytesRead;
+        rangeBuffer.flip();
+        
+        // Process vectors efficiently from the bulk-read buffer
         int readCount = 0;
-        while (readCount < count && (startIndex + readCount) < totalCount) {
+        while (rangeBuffer.remaining() >= dimension * 4 && readCount < count && (startIndex + readCount) < totalCount) {
           float[] row = new float[dimension];
           
+          // Direct float reading from buffer - much faster than individual byte reads
           for (int i = 0; i < dimension; i++) {
-            byte[] bytes = is.readNBytes(4);
-            if (bytes.length < 4) {
-              // End of file reached
-              is.close();
-              return;
-            }
-            ByteBuffer bbf = ByteBuffer.wrap(bytes);
-            bbf.order(ByteOrder.LITTLE_ENDIAN);
-            row[i] = bbf.getFloat();
+            row[i] = rangeBuffer.getFloat();
           }
           
           vectors.add(row);
           readCount++;
         }
+        
+        channel.close();
       } else {
         // For .fvecs format, we need to read sequentially
         // This is less efficient but maintains compatibility
         log.warn("Range reading is less efficient for .fvecs format. Consider using .fbin format for better parallel performance.");
         
+        InputStream is = new FileInputStream(filePath);
         int currentIndex = 0;
         while (is.available() != 0 && currentIndex < startIndex + count) {
+          totalBytesRead += 4; // dimension bytes
           int dimension = getDimension(is);
           if (dimension <= 0 || dimension > 10000) {
             break;
@@ -282,7 +299,9 @@ public class FBIvecsReader {
           
           float[] row = new float[dimension];
           for (int i = 0; i < dimension; i++) {
-            ByteBuffer bbf = ByteBuffer.wrap(is.readNBytes(4));
+            byte[] bytes = is.readNBytes(4);
+            totalBytesRead += bytes.length;
+            ByteBuffer bbf = ByteBuffer.wrap(bytes);
             bbf.order(ByteOrder.LITTLE_ENDIAN);
             row[i] = bbf.getFloat();
           }
@@ -294,12 +313,120 @@ public class FBIvecsReader {
           
           currentIndex++;
         }
+        is.close();
       }
-      
-      is.close();
     } catch (Exception e) {
       log.error("Error reading range [{}, {}] from file: {}", startIndex, startIndex + count - 1, filePath, e);
       e.printStackTrace();
     }
+    
+    return new ReadResult(totalBytesRead);
+  }
+
+  /**
+   * Read vectors from a specific byte chunk of the file for efficient parallel processing.
+   * This avoids the performance issue of seeking from the beginning for each thread.
+   * Returns the exact number of bytes read from the file.
+   */
+  public static long readFvecsChunk(String filePath, Object chunkObj, List<float[]> vectors) {
+    long methodStart = System.currentTimeMillis();
+    long totalBytesRead = 0;
+    
+    try {
+      // Get chunk properties using reflection
+      long reflectionStart = System.currentTimeMillis();
+      Class<?> chunkClass = chunkObj.getClass();
+      long startByteOffset = (Long) chunkClass.getField("startByteOffset").get(chunkObj);
+      long endByteOffset = (Long) chunkClass.getField("endByteOffset").get(chunkObj);
+      int startVectorIndex = (Integer) chunkClass.getField("startVectorIndex").get(chunkObj);
+      int estimatedVectorCount = (Integer) chunkClass.getField("estimatedVectorCount").get(chunkObj);
+      long reflectionTime = System.currentTimeMillis() - reflectionStart;
+      
+      // Pre-allocate vector list with estimated capacity (if it's an ArrayList)
+      if (vectors instanceof ArrayList) {
+        ((ArrayList<float[]>) vectors).ensureCapacity(estimatedVectorCount);
+      }
+      
+      // Open file channel for optimized reading
+      long fileOpenStart = System.currentTimeMillis();
+      FileChannel channel = FileChannel.open(Paths.get(filePath), StandardOpenOption.READ);
+      long fileOpenTime = System.currentTimeMillis() - fileOpenStart;
+      
+      if (filePath.endsWith(".fbin")) {
+        // Read header efficiently with NIO
+        long headerStart = System.currentTimeMillis();
+        ByteBuffer headerBuffer = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN);
+        channel.position(0);
+        channel.read(headerBuffer);
+        headerBuffer.flip();
+        int totalCount = headerBuffer.getInt();
+        int dimension = headerBuffer.getInt();
+        totalBytesRead += 8;
+        long headerTime = System.currentTimeMillis() - headerStart;
+        
+        if (dimension <= 0 || dimension > 10000) {
+          log.warn("Invalid dimension: {}", dimension);
+          channel.close();
+          return totalBytesRead;
+        }
+        
+        // Bulk read entire chunk in one operation
+        long chunkSize = endByteOffset - startByteOffset;
+        long bulkReadStart = System.currentTimeMillis();
+        
+        ByteBuffer chunkBuffer = ByteBuffer.allocate((int)chunkSize).order(ByteOrder.LITTLE_ENDIAN);
+        channel.position(startByteOffset);
+        int bytesRead = channel.read(chunkBuffer);
+        totalBytesRead += bytesRead;
+        chunkBuffer.flip();
+        
+        long bulkReadTime = System.currentTimeMillis() - bulkReadStart;
+        
+        // Process vectors efficiently from the bulk-read buffer
+        long vectorProcessStart = System.currentTimeMillis();
+        int vectorsRead = 0;
+        int vectorIndex = startVectorIndex;
+        
+        while (chunkBuffer.remaining() >= dimension * 4) {
+          float[] row = new float[dimension];
+          
+          // Direct float reading from buffer - much faster than individual byte reads
+          for (int i = 0; i < dimension; i++) {
+            row[i] = chunkBuffer.getFloat();
+          }
+          
+          vectors.add(row);
+          vectorsRead++;
+          vectorIndex++;
+          
+          if (vectorIndex % 1000 == 0) {
+            System.out.print(".");
+          }
+        }
+        
+        long vectorProcessTime = System.currentTimeMillis() - vectorProcessStart;
+        long totalTime = System.currentTimeMillis() - methodStart;
+        
+        log.debug("Chunk [{}->{}] OPTIMIZED timing: reflection={}ms, fileOpen={}ms, header={}ms, bulkRead={}ms, vectorProcess={}ms, total={}ms", 
+                 startByteOffset, endByteOffset, reflectionTime, fileOpenTime, headerTime, bulkReadTime, vectorProcessTime, totalTime);
+        log.debug("Chunk read complete. Read {} vectors ({} bytes) from offset {} to {}", 
+                 vectorsRead, totalBytesRead, startByteOffset, endByteOffset);
+        
+      } else {
+        log.warn("Chunk reading optimized for .fbin format. Using fallback for .fvecs format.");
+        // For .fvecs, fall back to sequential reading - not optimal but functional
+        readFvecs(filePath, -1, vectors);
+        totalBytesRead = -1; // Cannot track bytes for fallback
+      }
+      
+      channel.close();
+      
+    } catch (Exception e) {
+      long totalTime = System.currentTimeMillis() - methodStart;
+      log.error("Error reading chunk from file: {} (after {}ms)", filePath, totalTime, e);
+      e.printStackTrace();
+    }
+    
+    return totalBytesRead;
   }
 }

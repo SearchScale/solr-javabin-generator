@@ -12,25 +12,20 @@ import java.util.Arrays;
 
 public class PerformanceBenchmark {
     
-    private static final String FBIN_FILE = "base.1M.fbin";
-    private static final int BATCH_SIZE = 25000;
-    private static final int TOTAL_DOCS = 500000; // 20 batches of 25k each
-    private static final int NUM_BATCHES = 20;
+    // Default values
+    private static String FBIN_FILE = "base.1M.fbin";
+    private static int BATCH_SIZE = 6250;
+    private static int TOTAL_DOCS = 50000;
+    private static int NUM_BATCHES = 8;
     
     public static void main(String[] args) throws Exception {
+        // Parse command line arguments
+        parseArguments(args);
+        
         System.out.println("=".repeat(80));
         System.out.println("JavaBin Batch Generation Performance Benchmark");
         System.out.println("=".repeat(80));
         System.out.println();
-        
-        // Check if base.1M.fbin exists
-        if (!new File(FBIN_FILE).exists()) {
-            System.err.println("Error: " + FBIN_FILE + " not found!");
-            System.err.println("Please download the dataset first:");
-            System.err.println("wget https://data.rapids.ai/raft/datasets/wiki_all_1M/wiki_all_1M.tar");
-            System.err.println("tar -xf wiki_all_1M.tar");
-            System.exit(1);
-        }
         
         System.out.println("Configuration:");
         System.out.println("- Input file: " + FBIN_FILE);
@@ -40,16 +35,17 @@ public class PerformanceBenchmark {
         System.out.println();
         
         // Clean up any existing benchmark directories
+        System.out.println("Cleaning up previous benchmark directories...");
         cleanupDirectory("benchmark_single");
         cleanupDirectory("benchmark_multi");
+        
+        // Run multi-threaded benchmark first using all available processors
+        System.out.println("Running multi-threaded benchmark (all processors)...");
+        BenchmarkResult multiThreadResult = runBenchmark("all", "benchmark_multi");
         
         // Run single-threaded benchmark
         System.out.println("Running single-threaded benchmark...");
         BenchmarkResult singleThreadResult = runBenchmark(1, "benchmark_single");
-        
-        // Run multi-threaded benchmark using all available processors
-        System.out.println("Running multi-threaded benchmark (all processors)...");
-        BenchmarkResult multiThreadResult = runBenchmark("all", "benchmark_multi");
         
         // Compare generated files
         System.out.println("Comparing generated files...");
@@ -57,19 +53,17 @@ public class PerformanceBenchmark {
         
         // Print summary
         printSummary(singleThreadResult, multiThreadResult, filesIdentical);
-        
-        // Clean up
-        cleanupDirectory("benchmark_single");
-        cleanupDirectory("benchmark_multi");
     }
     
     private static class BenchmarkResult {
         final long executionTime;
         final int actualThreads;
+        final long bytesRead;
         
-        BenchmarkResult(long executionTime, int actualThreads) {
+        BenchmarkResult(long executionTime, int actualThreads, long bytesRead) {
             this.executionTime = executionTime;
             this.actualThreads = actualThreads;
+            this.bytesRead = bytesRead;
         }
     }
     
@@ -92,11 +86,39 @@ public class PerformanceBenchmark {
             actualThreads = Integer.parseInt(threads.toString());
         }
         
+        // Capture output to extract bytes read
+        java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+        java.io.PrintStream originalOut = System.out;
+        java.io.PrintStream ps = new java.io.PrintStream(baos);
+        System.setOut(ps);
+        
         long startTime = System.currentTimeMillis();
         Indexer.main(args);
         long endTime = System.currentTimeMillis();
         
-        return new BenchmarkResult(endTime - startTime, actualThreads);
+        // Restore original output
+        System.setOut(originalOut);
+        String output = baos.toString();
+        
+        // Print the output
+        System.out.print(output);
+        
+        // Extract bytes read from output
+        long bytesRead = 0;
+        String[] lines = output.split("\n");
+        for (String line : lines) {
+            if (line.contains("TOTAL BYTES READ FROM FILE:")) {
+                String bytesStr = line.replaceAll(".*: ([0-9]+) bytes.*", "$1");
+                try {
+                    bytesRead = Long.parseLong(bytesStr);
+                } catch (NumberFormatException e) {
+                    // Ignore parsing errors
+                }
+                break;
+            }
+        }
+        
+        return new BenchmarkResult(endTime - startTime, actualThreads, bytesRead);
     }
     
     private static boolean compareFiles(String dir1, String dir2) {
@@ -163,18 +185,19 @@ public class PerformanceBenchmark {
         try {
             Path dir = Paths.get(dirName);
             if (Files.exists(dir)) {
+                System.out.println("  Removing existing directory: " + dirName);
                 Files.walk(dir)
                     .sorted((a, b) -> b.compareTo(a))
                     .forEach(path -> {
                         try {
                             Files.delete(path);
                         } catch (IOException e) {
-                            // Ignore cleanup errors
+                            System.err.println("  Warning: Could not delete " + path + ": " + e.getMessage());
                         }
                     });
             }
         } catch (IOException e) {
-            // Ignore cleanup errors
+            System.err.println("  Warning: Error cleaning up " + dirName + ": " + e.getMessage());
         }
     }
     
@@ -212,6 +235,12 @@ public class PerformanceBenchmark {
             String.format("%.2f sec/batch", singleThreadSec / NUM_BATCHES),
             String.format("%.2f sec/batch", multiThreadSec / NUM_BATCHES),
             String.format("%.2fx faster", (singleThreadSec / NUM_BATCHES) / (multiThreadSec / NUM_BATCHES)));
+            
+        System.out.printf("%-25s | %-15s | %-15s | %-15s%n", 
+            "Total Bytes Read", 
+            String.format("%,d bytes", singleThreadResult.bytesRead),
+            String.format("%,d bytes", multiThreadResult.bytesRead),
+            String.format("%.1f%% diff", ((double)(multiThreadResult.bytesRead - singleThreadResult.bytesRead) / singleThreadResult.bytesRead) * 100));
         
         System.out.println("-".repeat(80));
         System.out.printf("%-25s | %-47s%n", 
@@ -222,8 +251,8 @@ public class PerformanceBenchmark {
         System.out.println("Summary:");
         System.out.printf("• Multi-threading with %d threads achieved %.1f%% performance improvement%n", 
             multiThreadResult.actualThreads, improvement);
-        System.out.printf("• Processing %.1fM vectors took %.2f seconds (vs %.2f seconds single-threaded)%n", 
-            TOTAL_DOCS / 1000000.0, multiThreadSec, singleThreadSec);
+        System.out.printf("• Processing %,d vectors took %.2f seconds (vs %.2f seconds single-threaded)%n", 
+            TOTAL_DOCS, multiThreadSec, singleThreadSec);
         System.out.printf("• Throughput increased from %,.0f to %,.0f documents per second%n", 
             TOTAL_DOCS / singleThreadSec, TOTAL_DOCS / multiThreadSec);
         
@@ -235,5 +264,58 @@ public class PerformanceBenchmark {
         
         System.out.println();
         System.out.println("=".repeat(80));
+    }
+    
+    private static void parseArguments(String[] args) {
+        if (args.length > 0 && (args[0].equals("-h") || args[0].equals("--help"))) {
+            printUsage();
+            System.exit(0);
+        }
+        
+        for (String arg : args) {
+            if (arg.startsWith("file=")) {
+                FBIN_FILE = arg.substring(5);
+            } else if (arg.startsWith("total_docs=")) {
+                TOTAL_DOCS = Integer.parseInt(arg.substring(11));
+            } else if (arg.startsWith("batch_size=")) {
+                BATCH_SIZE = Integer.parseInt(arg.substring(11));
+            } else if (!arg.isEmpty()) {
+                System.err.println("Unknown argument: " + arg);
+                printUsage();
+                System.exit(1);
+            }
+        }
+        
+        // Calculate number of batches based on total docs and batch size
+        NUM_BATCHES = (int) Math.ceil((double) TOTAL_DOCS / BATCH_SIZE);
+        
+        // Validate arguments
+        if (TOTAL_DOCS <= 0) {
+            System.err.println("Error: total_docs must be positive");
+            System.exit(1);
+        }
+        if (BATCH_SIZE <= 0) {
+            System.err.println("Error: batch_size must be positive");
+            System.exit(1);
+        }
+        if (!new File(FBIN_FILE).exists()) {
+            System.err.println("Error: File does not exist: " + FBIN_FILE);
+            System.exit(1);
+        }
+    }
+    
+    private static void printUsage() {
+        System.out.println("Usage: java PerformanceBenchmark [options]");
+        System.out.println();
+        System.out.println("Options:");
+        System.out.println("  file=<filename>        Input .fbin file (default: base.1M.fbin)");
+        System.out.println("  total_docs=<number>    Total number of documents to process (default: 50000)");
+        System.out.println("  batch_size=<number>    Documents per batch (default: 6250)");
+        System.out.println("  -h, --help            Show this help message");
+        System.out.println();
+        System.out.println("Examples:");
+        System.out.println("  java PerformanceBenchmark file=vectors.fbin total_docs=10000 batch_size=1000");
+        System.out.println("  java PerformanceBenchmark total_docs=100000");
+        System.out.println();
     }
 }
