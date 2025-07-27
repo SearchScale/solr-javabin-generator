@@ -4,6 +4,7 @@ import static org.apache.solr.common.util.JavaBinCodec.END;
 import static org.apache.solr.common.util.JavaBinCodec.ITERATOR;
 
 import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -24,7 +25,10 @@ import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiConsumer;
 import java.util.zip.GZIPInputStream;
 
@@ -191,9 +195,8 @@ public class Indexer {
   }
   
   private static void processFvecFileSingleThreaded(Params p, long docsCount, long batchSz) throws Exception {
-    System.out.println("Using single-threaded processing");
+    System.out.println("Using optimized single-threaded processing");
     
-    // Calculate total batches needed
     int totalBatches = (int) Math.ceil((double) docsCount / batchSz);
     long totalBytesRead = 0;
     
@@ -214,89 +217,135 @@ public class Indexer {
   }
 
   private static void processFvecFileMultiThreaded(Params p, long docsCount, long batchSz) throws Exception {
-    System.out.println("Using " + p.threads + " threads for parallel processing");
+    System.out.println("Using optimized multi-threaded processing with " + p.threads + " threads");
     
-    // Calculate number of batches needed (same logic as single-threaded)
     int totalBatches = (int) Math.ceil((double) docsCount / batchSz);
     
-    // Get file information for chunking approach - use batches, not threads
-    long chunkCalcStart = System.currentTimeMillis();
-    FileChunkInfo chunkInfo = calculateFileChunks(p.dataFile, docsCount, totalBatches);
-    long chunkCalcEnd = System.currentTimeMillis();
-    long chunkCalcTime = chunkCalcEnd - chunkCalcStart;
+    // Choose optimal approach based on dataset size
+    boolean isLargeDataset = docsCount > 1_000_000;
+    boolean isHighThreadCount = p.threads > 8;
     
-    System.out.println("calculateFileChunks() took: " + chunkCalcTime + "ms");
-    System.out.println("File chunking info: total size=" + chunkInfo.fileSize + " bytes, " +
-                       "estimated bytes per vector=" + chunkInfo.bytesPerVector + ", " +
-                       "chunks=" + chunkInfo.chunks.size());
-    
-    // Use ExecutorService for thread management
+    if (isLargeDataset || isHighThreadCount) {
+      // Use conservative approach for large datasets
+      processLargeDatasetMultiThreaded(p, docsCount, batchSz, totalBatches);
+    } else {
+      // Use aggressive approach for smaller datasets
+      processSmallDatasetMultiThreaded(p, docsCount, batchSz, totalBatches);
+    }
+  }
+  
+  // Optimized processing for large datasets or high thread counts
+  private static void processLargeDatasetMultiThreaded(Params p, long docsCount, long batchSz, int totalBatches) throws Exception {
     ExecutorService executor = Executors.newFixedThreadPool(p.threads);
-    
     AtomicInteger completedBatches = new AtomicInteger(0);
-    AtomicInteger totalDocsProcessed = new AtomicInteger(0);
-    
-    List<Future<ChunkProcessingResult>> futures = new ArrayList<>();
-    
-    long taskSubmitStart = System.currentTimeMillis();
+    AtomicLong totalBytesRead = new AtomicLong(0);
+    List<Future<Long>> futures = new ArrayList<>();
     
     try {
-      for (int i = 0; i < chunkInfo.chunks.size(); i++) {
-        final int chunkIndex = i;
-        final FileChunk chunk = chunkInfo.chunks.get(i);
+      // Submit batch processing tasks directly
+      for (int batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
+        final int finalBatchIndex = batchIndex;
+        final long startIndex = batchIndex * batchSz;
+        final int batchSize = (int) Math.min(batchSz, docsCount - startIndex);
         
-        Future<ChunkProcessingResult> future = executor.submit(() -> {
+        Future<Long> future = executor.submit(() -> {
           try {
-            ChunkProcessingResult result = processBatchChunked(p, chunkIndex, chunk, (int) batchSz);
+            long bytesRead = processBatch(p, finalBatchIndex, startIndex, batchSize);
+            totalBytesRead.addAndGet(bytesRead);
+            
             int completed = completedBatches.incrementAndGet();
-            totalDocsProcessed.addAndGet(result.documentsProcessed);
-            System.out.println("Completed chunk " + chunkIndex + " with " + result.documentsProcessed + " documents (" + 
-                               completed + "/" + chunkInfo.chunks.size() + ") - Total processed: " + totalDocsProcessed.get());
-            return result;
+            System.out.println("Completed batch " + finalBatchIndex + " (" + completed + "/" + totalBatches + 
+                             ") - Total processed: " + (completed * batchSz));
+            return bytesRead;
           } catch (Exception e) {
-            System.err.println("Error processing chunk " + chunkIndex + ": " + e.getMessage());
+            System.err.println("Error processing batch " + finalBatchIndex + ": " + e.getMessage());
             e.printStackTrace();
-            return new ChunkProcessingResult(0, 0);
+            return 0L;
           }
         });
         
         futures.add(future);
       }
       
-      long taskSubmitTime = System.currentTimeMillis() - taskSubmitStart;
-      
-      // Wait for all tasks to complete and collect results
-      long waitStart = System.currentTimeMillis();
-      int totalProcessed = 0;
-      long totalBytesRead = 0;
-      for (int i = 0; i < futures.size(); i++) {
-        ChunkProcessingResult result = futures.get(i).get();
-        totalProcessed += result.documentsProcessed;
-        totalBytesRead += result.bytesRead;
-        System.out.println("Chunk " + i + " processed " + result.documentsProcessed + " documents, read " + result.bytesRead + " bytes");
+      // Wait for completion
+      for (Future<Long> future : futures) {
+        future.get();
       }
       
-      long waitTime = System.currentTimeMillis() - waitStart;
-      long totalMultiThreadTime = System.currentTimeMillis() - chunkCalcEnd;
-      
-      System.out.println("[TIMING] All tasks waited/completed in " + waitTime + "ms");
-      System.out.println("[TIMING] Total multithreaded processing time: " + totalMultiThreadTime + "ms");
-      System.out.println("All chunks completed successfully!");
-      System.out.println("Total documents processed: " + totalProcessed);
-      System.out.println("TOTAL BYTES READ FROM FILE: " + totalBytesRead + " bytes");
+      System.out.println("All batches completed successfully!");
+      System.out.println("Total documents processed: " + docsCount);
+      System.out.println("TOTAL BYTES READ FROM FILE: " + totalBytesRead.get() + " bytes");
       
     } finally {
       executor.shutdown();
+    }
+  }
+  
+  // Optimized processing for smaller datasets with aggressive optimizations
+  private static void processSmallDatasetMultiThreaded(Params p, long docsCount, long batchSz, int totalBatches) throws Exception {
+    // Use ForkJoinPool for better work distribution on smaller datasets
+    ForkJoinPool pool = new ForkJoinPool(p.threads);
+    
+    ConcurrentLinkedQueue<Integer> workQueue = new ConcurrentLinkedQueue<>();
+    for (int i = 0; i < totalBatches; i++) {
+      workQueue.offer(i);
+    }
+    
+    AtomicInteger completedBatches = new AtomicInteger(0);
+    AtomicLong totalBytesRead = new AtomicLong(0);
+    
+    try {
+      List<Future<?>> futures = new ArrayList<>();
+      
+      // Submit worker tasks with work-stealing
+      for (int t = 0; t < p.threads; t++) {
+        futures.add(pool.submit(() -> {
+          Integer batchIndex;
+          while ((batchIndex = workQueue.poll()) != null) {
+            try {
+              long startIndex = batchIndex * batchSz;
+              int batchSize = (int) Math.min(batchSz, docsCount - startIndex);
+              
+              long bytesRead = processBatch(p, batchIndex, startIndex, batchSize);
+              totalBytesRead.addAndGet(bytesRead);
+              
+              int completed = completedBatches.incrementAndGet();
+              System.out.println("Completed batch " + batchIndex + " (" + completed + "/" + totalBatches + 
+                               ") - Total processed: " + (completed * batchSz));
+            } catch (Exception e) {
+              System.err.println("Error processing batch " + batchIndex + ": " + e.getMessage());
+              e.printStackTrace();
+            }
+          }
+        }));
+      }
+      
+      // Wait for completion
+      for (Future<?> future : futures) {
+        future.get();
+      }
+      
+      System.out.println("All batches completed successfully!");
+      System.out.println("Total documents processed: " + docsCount);
+      System.out.println("TOTAL BYTES READ FROM FILE: " + totalBytesRead.get() + " bytes");
+      
+    } finally {
+      pool.shutdown();
     }
   }
 
   private static long processBatch(Params p, int batchIndex, long startIndex, int batchSize) throws Exception {
     String name = Paths.get(p.outputDir, "batch." + batchIndex).toString();
     
-    // Use optimized reader with standard JavaBin writer for compatibility
-    try (FileOutputStream os = new FileOutputStream(name)) {
-      JavaBinCodec codec = new J(os);
+    // Use buffered output stream for better I/O performance
+    try (FileOutputStream fos = new FileOutputStream(name);
+         java.io.BufferedOutputStream bos = new java.io.BufferedOutputStream(fos, 64 * 1024)) {
+      
+      JavaBinCodec codec = new J(bos);
       codec.writeTag(ITERATOR);
+      
+      // Pre-allocate reusable list with estimated capacity
+      List<Float> reusableFloatList = new ArrayList<>(1024); // Will grow as needed
       
       // Use optimized memory-mapped reading for best performance
       long bytesRead = OptimizedReader.streamFvecsRangeMapped(p.dataFile, (int) startIndex, batchSize, (vector, index) -> {
@@ -304,14 +353,22 @@ public class Indexer {
           final int docId = (int) (startIndex + index);
           final float[] vectorData = vector;
           
+          // Clear and reuse the list for better memory efficiency
+          reusableFloatList.clear();
+          
+          // Ensure capacity if vector is larger than current capacity
+          if (reusableFloatList instanceof ArrayList && vectorData.length > ((ArrayList<Float>) reusableFloatList).size()) {
+            ((ArrayList<Float>) reusableFloatList).ensureCapacity(vectorData.length);
+          }
+          
+          // Batch add operation - more efficient than individual adds
+          for (float f : vectorData) {
+            reusableFloatList.add(f);
+          }
+          
           MapWriter d = ew -> {
             ew.put("id", String.valueOf(docId));
-            // Convert float[] to List<Float> for Solr compatibility
-            List<Float> floatList = new ArrayList<>();
-            for (float f : vectorData) {
-              floatList.add(f);
-            }
-            ew.put("article_vector", floatList);
+            ew.put("article_vector", reusableFloatList);
           };
           
           codec.writeMap(d);
@@ -328,64 +385,6 @@ public class Indexer {
     }
   }
 
-  // Class to hold processing results
-  private static class ChunkProcessingResult {
-    final int documentsProcessed;
-    final long bytesRead;
-    
-    ChunkProcessingResult(int documentsProcessed, long bytesRead) {
-      this.documentsProcessed = documentsProcessed;
-      this.bytesRead = bytesRead;
-    }
-  }
-  
-  private static ChunkProcessingResult processBatchChunked(Params p, int chunkIndex, FileChunk chunk, int maxBatchSize) throws Exception {
-    long chunkStart = System.currentTimeMillis();
-    
-    String name = Paths.get(p.outputDir, "batch." + chunkIndex).toString();
-    
-    // Use optimized reader with standard JavaBin writer for chunks as well
-    long readStart = System.currentTimeMillis();
-    final AtomicInteger vectorCount = new AtomicInteger(0);
-    
-    try (FileOutputStream os = new FileOutputStream(name)) {
-      JavaBinCodec codec = new J(os);
-      codec.writeTag(ITERATOR);
-      
-      // Use optimized memory-mapped chunk reading
-      long bytesRead = OptimizedReader.streamFvecsChunkMapped(p.dataFile, chunk, (vector, index) -> {
-        try {
-          final int docId = chunk.startVectorIndex + index;
-          final float[] vectorData = vector;
-          
-          MapWriter d = ew -> {
-            ew.put("id", String.valueOf(docId));
-            // Convert float[] to List<Float> for Solr compatibility
-            List<Float> floatList = new ArrayList<>();
-            for (float f : vectorData) {
-              floatList.add(f);
-            }
-            ew.put("article_vector", floatList);
-          };
-          
-          codec.writeMap(d);
-          vectorCount.incrementAndGet();
-        } catch (IOException e) {
-          throw new RuntimeException("Error writing vector to JavaBin", e);
-        }
-      });
-      
-      codec.writeTag(END);
-      codec.close();
-      
-      long readTime = System.currentTimeMillis() - readStart;
-      long totalTime = System.currentTimeMillis() - chunkStart;
-      
-      System.out.println(name + " (" + vectorCount.get() + " documents, " + bytesRead + " bytes read)");
-      
-      return new ChunkProcessingResult(vectorCount.get(), bytesRead);
-    }
-  }
 
   private static boolean writeBatch(long docsCount, BufferedReader br, JavaBinCodec codec)
       throws IOException {
@@ -501,86 +500,5 @@ public class Indexer {
 
   static TypeReference<List<Float>> valueTypeRef = new TypeReference<>() {
   };
-
-  // File chunking classes for efficient parallel processing
-  private static class FileChunk {
-    public final long startByteOffset;
-    public final long endByteOffset;
-    public final int startVectorIndex;
-    public final int estimatedVectorCount;
-    
-    FileChunk(long startByteOffset, long endByteOffset, int startVectorIndex, int estimatedVectorCount) {
-      this.startByteOffset = startByteOffset;
-      this.endByteOffset = endByteOffset;
-      this.startVectorIndex = startVectorIndex;
-      this.estimatedVectorCount = estimatedVectorCount;
-    }
-  }
-  
-  private static class FileChunkInfo {
-    final long fileSize;
-    final long bytesPerVector;
-    final List<FileChunk> chunks;
-    
-    FileChunkInfo(long fileSize, long bytesPerVector, List<FileChunk> chunks) {
-      this.fileSize = fileSize;
-      this.bytesPerVector = bytesPerVector;
-      this.chunks = chunks;
-    }
-  }
-  
-  private static FileChunkInfo calculateFileChunks(String filePath, long totalVectors, int numChunks) throws IOException {
-    File file = new File(filePath);
-    long fileSize = file.length();
-    
-    // For .fbin files, read the actual vector count from header to calculate bytes per vector correctly
-    long actualVectorsInFile = totalVectors;
-    if (filePath.endsWith(".fbin")) {
-      // Read the actual count from the .fbin file header
-      try (FileInputStream fis = new FileInputStream(filePath)) {
-        byte[] countBytes = new byte[4];
-        fis.read(countBytes);
-        ByteBuffer bb = ByteBuffer.wrap(countBytes);
-        bb.order(ByteOrder.LITTLE_ENDIAN);
-        actualVectorsInFile = bb.getInt();
-      } catch (Exception e) {
-        // Fallback to provided totalVectors if header read fails
-        System.err.println("Warning: Could not read vector count from .fbin header, using provided count: " + totalVectors);
-      }
-    }
-    
-    // Calculate bytes per vector based on actual file content
-    long dataSize = fileSize;
-    if (filePath.endsWith(".fbin")) {
-      dataSize = fileSize - 8; // subtract header size
-    }
-    long bytesPerVector = dataSize / actualVectorsInFile;
-    
-    // Calculate the total data size we actually want to process (only for requested vectors)
-    long requestedDataSize = totalVectors * bytesPerVector;
-    
-    // Calculate chunk size based on requested data, not entire file
-    long chunkSize = requestedDataSize / numChunks;
-    
-    List<FileChunk> chunks = new ArrayList<>();
-    
-    for (int i = 0; i < numChunks; i++) {
-      long startOffset = i * chunkSize;
-      long endOffset = (i == numChunks - 1) ? requestedDataSize : (i + 1) * chunkSize;
-      
-      // For .fbin files, add header offset
-      if (filePath.endsWith(".fbin")) {
-        startOffset += 8;
-        endOffset += 8;
-      }
-      
-      int startVectorIndex = (int) (i * totalVectors / numChunks);
-      int estimatedVectorCount = (int) ((endOffset - startOffset) / bytesPerVector);
-      
-      chunks.add(new FileChunk(startOffset, endOffset, startVectorIndex, estimatedVectorCount));
-    }
-    
-    return new FileChunkInfo(fileSize, bytesPerVector, chunks);
-  }
 
 }
