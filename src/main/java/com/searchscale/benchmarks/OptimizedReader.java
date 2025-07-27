@@ -14,8 +14,8 @@ import java.util.function.BiConsumer;
  */
 public class OptimizedReader {
     
-    // Use larger buffer size for bulk reading
-    private static final int BUFFER_SIZE = 64 * 1024; // 64KB buffer
+    // Use larger buffer size for bulk reading - optimized for modern hardware
+    private static final int BUFFER_SIZE = 256 * 1024; // 256KB buffer for better throughput
     
     /**
      * Ultra-fast streaming using memory-mapped I/O
@@ -45,10 +45,15 @@ public class OptimizedReader {
             long dataSize = Math.min((long) count * dimension * 4L, 
                                      file.length() - startByteOffset);
             
-            // Memory map the required portion of the file
+            // Memory map the required portion of the file with read-ahead hints
             MappedByteBuffer mappedBuffer = channel.map(
                 FileChannel.MapMode.READ_ONLY, startByteOffset, dataSize);
             mappedBuffer.order(ByteOrder.LITTLE_ENDIAN);
+            
+            // Set load hint for better performance on large sequential reads
+            if (mappedBuffer.capacity() > 1024 * 1024) { // For buffers > 1MB
+                mappedBuffer.load(); // Hint to OS to pre-load into memory
+            }
             
             totalBytesRead += dataSize;
             
@@ -58,6 +63,7 @@ public class OptimizedReader {
                     break;
                 }
                 
+                // Allocate vector for each iteration (consumer may keep reference)
                 float[] vector = new float[dimension];
                 for (int j = 0; j < dimension; j++) {
                     vector[j] = mappedBuffer.getFloat();
@@ -163,11 +169,16 @@ public class OptimizedReader {
                     return totalBytesRead;
                 }
                 
-                // Memory map the chunk
+                // Memory map the chunk with optimization hints
                 long chunkSize = endByteOffset - startByteOffset;
                 MappedByteBuffer mappedBuffer = channel.map(
                     FileChannel.MapMode.READ_ONLY, startByteOffset, chunkSize);
                 mappedBuffer.order(ByteOrder.LITTLE_ENDIAN);
+                
+                // Set load hint for better performance on large chunks
+                if (mappedBuffer.capacity() > 1024 * 1024) {
+                    mappedBuffer.load();
+                }
                 
                 totalBytesRead += chunkSize;
                 
