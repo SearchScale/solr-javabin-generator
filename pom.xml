@@ -167,6 +167,15 @@
       <plugin>
         <artifactId>maven-failsafe-plugin</artifactId>
         <version>3.3.0</version>
+        <configuration>
+          <systemPropertyVariables>
+            <tests.threadLeakIgnore>true</tests.threadLeakIgnore>
+            <tests.leaveTemporary>false</tests.leaveTemporary>
+            <tests.threadLeakFilters>com.carrotsearch.randomizedtesting.ThreadLeakControl$IgnoreEverything</tests.threadLeakFilters>
+            <test.solr.allowed.securerandom>DRBG</test.solr.allowed.securerandom>
+            <java.security.egd>file:/dev/./urandom</java.security.egd>
+          </systemPropertyVariables>
+        </configuration>
         <executions>
           <execution>
             <goals>
@@ -196,6 +205,15 @@
         <plugin>
           <artifactId>maven-surefire-plugin</artifactId>
           <version>3.3.0</version>
+          <configuration>
+            <systemPropertyVariables>
+              <tests.threadLeakIgnore>true</tests.threadLeakIgnore>
+            <tests.leaveTemporary>false</tests.leaveTemporary>
+            <tests.threadLeakFilters>com.carrotsearch.randomizedtesting.ThreadLeakControl$IgnoreEverything</tests.threadLeakFilters>
+              <test.solr.allowed.securerandom>DRBG</test.solr.allowed.securerandom>
+              <java.security.egd>file:/dev/./urandom</java.security.egd>
+            </systemPropertyVariables>
+          </configuration>
         </plugin>
         <plugin>
           <artifactId>maven-failsafe-plugin</artifactId>

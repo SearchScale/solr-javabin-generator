@@ -4,13 +4,17 @@ import org.apache.solr.client.solrj.SolrClient;
 import org.apache.solr.client.solrj.SolrQuery;
 import org.apache.solr.client.solrj.request.CollectionAdminRequest;
 import org.apache.solr.client.solrj.request.ContentStreamUpdateRequest;
+import org.apache.solr.client.solrj.request.GenericSolrRequest;
+import org.apache.solr.client.solrj.SolrRequest;
 import org.apache.solr.client.solrj.response.QueryResponse;
 import org.apache.solr.cloud.MiniSolrCloudCluster;
 import org.apache.solr.cloud.SolrCloudTestCase;
 import org.apache.solr.common.SolrInputDocument;
 import org.apache.solr.common.cloud.SolrZkClient;
+import org.apache.solr.common.params.MapSolrParams;
 import org.apache.solr.common.util.ContentStreamBase;
 import org.apache.solr.common.util.JavaBinCodec;
+import org.apache.solr.client.solrj.request.RequestWriter;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
@@ -22,6 +26,7 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -106,7 +111,6 @@ public class JavaBinSolrIT extends SolrCloudTestCase {
             "output_dir=" + tempDir.resolve("batches").toString(),
             "batch_size=" + BATCH_SIZE,
             "docs_count=" + VECTOR_COUNT,
-            "legacy=false",
             "overwrite=true"
         };
         
@@ -117,38 +121,44 @@ public class JavaBinSolrIT extends SolrCloudTestCase {
     public void testJavaBinUploadAndQuery() throws Exception {
         SolrClient solrClient = cluster.getSolrClient();
         
-        // Instead of parsing JavaBin files, recreate the documents directly
-        // Read vectors from test data file
-        String testFilePath = tempDir.resolve(TEST_FBIN_FILE).toString();
-        List<float[]> vectors = new ArrayList<>();
-        FBIvecsReader.readFvecs(testFilePath, VECTOR_COUNT, vectors);
-        
-        // Create and upload documents in batches
+        // Upload the generated JavaBin files directly to Solr
+        Path batchDir = tempDir.resolve("batches");
         int uploadedDocs = 0;
-        for (int i = 0; i < vectors.size(); i += BATCH_SIZE) {
-            List<SolrInputDocument> docs = new ArrayList<>();
-            int batchEnd = Math.min(i + BATCH_SIZE, vectors.size());
+        
+        // Calculate number of batches based on documents and batch size
+        int numBatches = (VECTOR_COUNT + BATCH_SIZE - 1) / BATCH_SIZE;
+        
+        for (int i = 0; i < numBatches; i++) {
+            Path batchFile = batchDir.resolve("batch." + i);
             
-            for (int j = i; j < batchEnd; j++) {
-                SolrInputDocument doc = new SolrInputDocument();
-                doc.addField("id", String.valueOf(j));
+            if (Files.exists(batchFile)) {
+                // Upload JavaBin file directly using GenericSolrRequest
+                GenericSolrRequest uploadRequest = new GenericSolrRequest(SolrRequest.METHOD.POST, 
+                    "/update", 
+                    new MapSolrParams(Map.of("commit", "false", "overwrite", "true", "collection", COLLECTION_NAME)))
+                    .setContentWriter(new RequestWriter.ContentWriter() {
+                        @Override
+                        public void write(OutputStream os) throws IOException {
+                            // Stream the entire JavaBin file directly to Solr
+                            Files.copy(batchFile, os);
+                        }
+
+                        @Override
+                        public String getContentType() {
+                            return "application/javabin";
+                        }
+                    });
                 
-                // Convert float[] to List<Float> for Solr compatibility
-                float[] vector = vectors.get(j);
-                List<Float> vectorList = new ArrayList<>();
-                for (float f : vector) {
-                    vectorList.add(f);
-                }
-                doc.addField("article_vector", vectorList);
-                docs.add(doc);
+                // Execute the request to post the entire JavaBin file
+                solrClient.request(uploadRequest);
                 
-            }
-            
-            if (!docs.isEmpty()) {
-                solrClient.add(COLLECTION_NAME, docs);
-                uploadedDocs += docs.size();
+                // Calculate actual documents in this batch
+                int docsInBatch = (i == numBatches - 1 && VECTOR_COUNT % BATCH_SIZE != 0) 
+                    ? VECTOR_COUNT % BATCH_SIZE 
+                    : BATCH_SIZE;
+                uploadedDocs += docsInBatch;
                 
-                System.out.println("Uploaded batch " + (i / BATCH_SIZE) + " with " + docs.size() + " documents");
+                System.out.println("Uploaded batch " + i + " with " + docsInBatch + " documents");
             }
         }
         

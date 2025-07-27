@@ -74,7 +74,6 @@ public class Indexer {
     public final String outputDir;
 
     public final int docsCount;
-    public final boolean isLegacy;
     public final boolean overwrite;
 
     Map<String, String> p;
@@ -102,7 +101,6 @@ public class Indexer {
 
       queryCount = Integer.parseInt(p.getOrDefault("query_count", "1"));
       runQuery = Boolean.parseBoolean(p.getOrDefault("query", "false"));
-      isLegacy = Boolean.parseBoolean(p.getOrDefault("legacy", "false"));
       overwrite = Boolean.parseBoolean(p.getOrDefault("overwrite", "false"));
     }
 
@@ -159,7 +157,7 @@ public class Indexer {
           String name = Paths.get(p.outputDir, "batch." + i).toString();
           try (FileOutputStream os = new FileOutputStream(name)) {
             JavaBinCodec codec = new J(os);
-            if (!writeBatch(batchSz, br, codec, p.isLegacy))
+            if (!writeBatch(batchSz, br, codec))
               break;
             System.out.println(name);
             count += batchSz;
@@ -295,29 +293,25 @@ public class Indexer {
   private static long processBatch(Params p, int batchIndex, long startIndex, int batchSize) throws Exception {
     String name = Paths.get(p.outputDir, "batch." + batchIndex).toString();
     
-    // Use streaming approach instead of loading all vectors into memory
+    // Use optimized reader with standard JavaBin writer for compatibility
     try (FileOutputStream os = new FileOutputStream(name)) {
       JavaBinCodec codec = new J(os);
       codec.writeTag(ITERATOR);
       
-      // Stream vectors directly from file to JavaBin output
-      long bytesRead = FBIvecsReader.streamFvecsRange(p.dataFile, (int) startIndex, batchSize, (vector, index) -> {
+      // Use optimized memory-mapped reading for best performance
+      long bytesRead = OptimizedReader.streamFvecsRangeMapped(p.dataFile, (int) startIndex, batchSize, (vector, index) -> {
         try {
           final int docId = (int) (startIndex + index);
           final float[] vectorData = vector;
           
           MapWriter d = ew -> {
             ew.put("id", String.valueOf(docId));
-            if (p.isLegacy) {
-              // Convert float[] to List<Float> for legacy mode
-              List<Float> floatList = new ArrayList<>();
-              for (float f : vectorData) {
-                floatList.add(f);
-              }
-              ew.put("article_vector", floatList);
-            } else {
-              ew.put("article_vector", vectorData);
+            // Convert float[] to List<Float> for Solr compatibility
+            List<Float> floatList = new ArrayList<>();
+            for (float f : vectorData) {
+              floatList.add(f);
             }
+            ew.put("article_vector", floatList);
           };
           
           codec.writeMap(d);
@@ -350,7 +344,7 @@ public class Indexer {
     
     String name = Paths.get(p.outputDir, "batch." + chunkIndex).toString();
     
-    // Use streaming approach for chunks as well
+    // Use optimized reader with standard JavaBin writer for chunks as well
     long readStart = System.currentTimeMillis();
     final AtomicInteger vectorCount = new AtomicInteger(0);
     
@@ -358,24 +352,20 @@ public class Indexer {
       JavaBinCodec codec = new J(os);
       codec.writeTag(ITERATOR);
       
-      // Stream vectors directly from chunk to JavaBin output
-      long bytesRead = FBIvecsReader.streamFvecsChunk(p.dataFile, chunk, (vector, index) -> {
+      // Use optimized memory-mapped chunk reading
+      long bytesRead = OptimizedReader.streamFvecsChunkMapped(p.dataFile, chunk, (vector, index) -> {
         try {
           final int docId = chunk.startVectorIndex + index;
           final float[] vectorData = vector;
           
           MapWriter d = ew -> {
             ew.put("id", String.valueOf(docId));
-            if (p.isLegacy) {
-              // Convert float[] to List<Float> for legacy mode
-              List<Float> floatList = new ArrayList<>();
-              for (float f : vectorData) {
-                floatList.add(f);
-              }
-              ew.put("article_vector", floatList);
-            } else {
-              ew.put("article_vector", vectorData);
+            // Convert float[] to List<Float> for Solr compatibility
+            List<Float> floatList = new ArrayList<>();
+            for (float f : vectorData) {
+              floatList.add(f);
             }
+            ew.put("article_vector", floatList);
           };
           
           codec.writeMap(d);
@@ -397,7 +387,7 @@ public class Indexer {
     }
   }
 
-  private static boolean writeBatch(long docsCount, BufferedReader br, JavaBinCodec codec, boolean legacy)
+  private static boolean writeBatch(long docsCount, BufferedReader br, JavaBinCodec codec)
       throws IOException {
     codec.writeTag(ITERATOR);
     int count = 0;
@@ -409,7 +399,7 @@ public class Indexer {
       }
       MapWriter d = null;
       try {
-        d = parseRow(parseLine(line), legacy);
+        d = parseRow(parseLine(line));
         codec.writeMap(d);
 
         count++;
@@ -446,7 +436,7 @@ public class Indexer {
     }
   }
 
-  static MapWriter parseRow(String[] row, boolean legacy) {
+  static MapWriter parseRow(String[] row) {
     String id;
     String title;
     String article;
@@ -466,16 +456,7 @@ public class Indexer {
 
       List<Float> floatList = OBJECT_MAPPER.readValue(json, valueTypeRef);
 
-      if (legacy) {
-        article_vector = floatList;
-
-      } else {
-        float[] floats = new float[floatList.size()];
-        for (int i = 0; i < floatList.size(); i++) {
-          floats[i] = floatList.get(i);
-        }
-        article_vector = floats;
-      }
+      article_vector = floatList;
 
       return ew -> {
         ew.put("id", id);
