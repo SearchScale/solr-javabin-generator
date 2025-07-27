@@ -17,6 +17,7 @@ public class PerformanceBenchmark {
     private static int BATCH_SIZE = 6250;
     private static int TOTAL_DOCS = 50000;
     private static int NUM_BATCHES = 8;
+    private static int THREADS = Runtime.getRuntime().availableProcessors(); // Default to all available cores
     
     public static void main(String[] args) throws Exception {
         // Parse command line arguments
@@ -32,6 +33,7 @@ public class PerformanceBenchmark {
         System.out.println("- Batch size: " + String.format("%,d", BATCH_SIZE) + " vectors");
         System.out.println("- Total batches: " + NUM_BATCHES);
         System.out.println("- Total vectors: " + String.format("%,d", TOTAL_DOCS));
+        System.out.println("- Threads: " + THREADS);
         System.out.println();
         
         // Clean up any existing benchmark directories
@@ -39,9 +41,9 @@ public class PerformanceBenchmark {
         cleanupDirectory("benchmark_single");
         cleanupDirectory("benchmark_multi");
         
-        // Run multi-threaded benchmark first using all available processors
-        System.out.println("Running multi-threaded benchmark (all processors)...");
-        BenchmarkResult multiThreadResult = runBenchmark("all", "benchmark_multi");
+        // Run multi-threaded benchmark using specified number of threads
+        System.out.println("Running multi-threaded benchmark (" + THREADS + " threads)...");
+        BenchmarkResult multiThreadResult = runBenchmark(THREADS, "benchmark_multi");
         
         // Run single-threaded benchmark
         System.out.println("Running single-threaded benchmark...");
@@ -278,6 +280,13 @@ public class PerformanceBenchmark {
                 TOTAL_DOCS = Integer.parseInt(arg.substring(11));
             } else if (arg.startsWith("batch_size=")) {
                 BATCH_SIZE = Integer.parseInt(arg.substring(11));
+            } else if (arg.startsWith("threads=")) {
+                String threadsValue = arg.substring(8);
+                if ("all".equalsIgnoreCase(threadsValue)) {
+                    THREADS = Runtime.getRuntime().availableProcessors();
+                } else {
+                    THREADS = Integer.parseInt(threadsValue);
+                }
             } else if (!arg.isEmpty()) {
                 System.err.println("Unknown argument: " + arg);
                 printUsage();
@@ -297,6 +306,10 @@ public class PerformanceBenchmark {
             System.err.println("Error: batch_size must be positive");
             System.exit(1);
         }
+        if (THREADS <= 0) {
+            System.err.println("Error: threads must be positive");
+            System.exit(1);
+        }
         if (!new File(FBIN_FILE).exists()) {
             System.err.println("Error: File does not exist: " + FBIN_FILE);
             System.exit(1);
@@ -310,11 +323,13 @@ public class PerformanceBenchmark {
         System.out.println("  file=<filename>        Input .fbin file (default: base.1M.fbin)");
         System.out.println("  total_docs=<number>    Total number of documents to process (default: 50000)");
         System.out.println("  batch_size=<number>    Documents per batch (default: 6250)");
+        System.out.println("  threads=<number|all>   Number of threads for multi-threaded benchmark (default: all available cores)");
         System.out.println("  -h, --help            Show this help message");
         System.out.println();
         System.out.println("Examples:");
         System.out.println("  java PerformanceBenchmark file=vectors.fbin total_docs=10000 batch_size=1000");
-        System.out.println("  java PerformanceBenchmark total_docs=100000");
+        System.out.println("  java PerformanceBenchmark total_docs=100000 threads=4");
+        System.out.println("  java PerformanceBenchmark threads=all");
         System.out.println();
     }
 }
