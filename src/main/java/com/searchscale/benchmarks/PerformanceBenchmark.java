@@ -73,7 +73,6 @@ public class PerformanceBenchmark {
             "output_dir=" + outputDir,
             "batch_size=" + BATCH_SIZE,
             "docs_count=" + TOTAL_DOCS,
-            "legacy=true",
             "overwrite=true",
             "threads=" + threads.toString()
         };
