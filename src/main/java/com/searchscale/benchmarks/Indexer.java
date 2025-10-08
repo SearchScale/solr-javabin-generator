@@ -79,12 +79,14 @@ public class Indexer {
 
     public final int docsCount;
     public final boolean overwrite;
+    public final boolean legacy;
 
     Map<String, String> p;
 
     public Params(String[] s) {
       p = parseStringToMap(s);
-      
+
+      legacy = Boolean.parseBoolean(p.getOrDefault("legacy", "true"));
       // Handle threads parameter - support "all" for all available processors
       String threadsParam = p.getOrDefault("threads", "1");
       if ("all".equalsIgnoreCase(threadsParam)) {
@@ -161,7 +163,7 @@ public class Indexer {
           String name = Paths.get(p.outputDir, "batch." + i).toString();
           try (FileOutputStream os = new FileOutputStream(name)) {
             JavaBinCodec codec = new J(os);
-            if (!writeBatch(batchSz, br, codec))
+            if (!writeBatch(batchSz, br, codec, p.legacy))
               break;
             System.out.println(name);
             count += batchSz;
@@ -353,25 +355,27 @@ public class Indexer {
           final int docId = (int) (startIndex + index);
           final float[] vectorData = vector;
           
-          // Clear and reuse the list for better memory efficiency
-          reusableFloatList.clear();
-          
-          // Ensure capacity if vector is larger than current capacity
-          if (reusableFloatList instanceof ArrayList && vectorData.length > ((ArrayList<Float>) reusableFloatList).size()) {
-            ((ArrayList<Float>) reusableFloatList).ensureCapacity(vectorData.length);
+          if (p.legacy){
+            reusableFloatList.clear();
+            if (reusableFloatList instanceof ArrayList && vectorData.length > ((ArrayList<Float>) reusableFloatList).size()){
+              ((ArrayList<Float>) reusableFloatList).ensureCapacity(vectorData.length);
+            }
+            for (float f : vectorData){
+              reusableFloatList.add(f);
+            }
+            MapWriter d = ew -> {
+              ew.put("id", String.valueOf(docId));
+              ew.put("article_vector", reusableFloatList);
+            };
+            codec.writeMap(d);
           }
-          
-          // Batch add operation - more efficient than individual adds
-          for (float f : vectorData) {
-            reusableFloatList.add(f);
+          else{
+            MapWriter d = ew -> {
+              ew.put("id", String.valueOf(docId));
+              ew.put("article_vector", vectorData);
+            };
+            codec.writeMap(d);
           }
-          
-          MapWriter d = ew -> {
-            ew.put("id", String.valueOf(docId));
-            ew.put("article_vector", reusableFloatList);
-          };
-          
-          codec.writeMap(d);
         } catch (IOException e) {
           throw new RuntimeException("Error writing vector to JavaBin", e);
         }
@@ -386,7 +390,7 @@ public class Indexer {
   }
 
 
-  private static boolean writeBatch(long docsCount, BufferedReader br, JavaBinCodec codec)
+  private static boolean writeBatch(long docsCount, BufferedReader br, JavaBinCodec codec, boolean legacy)
       throws IOException {
     codec.writeTag(ITERATOR);
     int count = 0;
@@ -398,7 +402,7 @@ public class Indexer {
       }
       MapWriter d = null;
       try {
-        d = parseRow(parseLine(line));
+        d = parseRow(parseLine(line), legacy);
         codec.writeMap(d);
 
         count++;
@@ -435,7 +439,7 @@ public class Indexer {
     }
   }
 
-  static MapWriter parseRow(String[] row) {
+  static MapWriter parseRow(String[] row, boolean legacy) {
     String id;
     String title;
     String article;
@@ -455,7 +459,16 @@ public class Indexer {
 
       List<Float> floatList = OBJECT_MAPPER.readValue(json, valueTypeRef);
 
-      article_vector = floatList;
+      if (legacy){
+        article_vector = floatList;
+      }
+      else{
+        float[] fv = new float[floatList.size()];
+        for (int i = 0; i < floatList.size(); i++){
+          fv[i] = floatList.get(i);
+        }
+        article_vector = fv;
+      }
 
       return ew -> {
         ew.put("id", id);
