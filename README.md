@@ -27,7 +27,7 @@ Generate JavaBin files from the 1M Wikipedia vector dataset (768 dimensions):
 mvn clean package
 wget https://data.rapids.ai/raft/datasets/wiki_all_1M/wiki_all_1M.tar
 tar -xf wiki_all_1M.tar
-java -jar target/javabin-generator-1.0-SNAPSHOT-jar-with-dependencies.jar data_file=base.1M.fbin output_dir=wiki_batches batch_size=10000 docs_count=1000000 threads=all
+java -jar target/javabin-generator-1.0-SNAPSHOT-jar-with-dependencies.jar data_file=base.1M.fbin output_dir=wiki_batches batch_size=10000 docs_count=1000000 threads=all legacy=true
 ```
 
 **Performance**: Using `threads=all` or `threads=4` can improve performance significantly (~80% faster) for large datasets.
@@ -43,6 +43,7 @@ You can customize the JavaBin generation by modifying the command-line parameter
 - `docs_count`: Total number of documents to process (default: 10000)
 - `threads`: Number of parallel threads for processing (default: 1, use `all` for all available processors)
 - `overwrite`: Delete existing files in output directory before processing (default: false)
+- 'legacy': When `true`, uses standard Solr JavaBin format; when `false`, writes compact float[] blocks for smaller files (default: true)
 
 ## Performance Benchmark
 
