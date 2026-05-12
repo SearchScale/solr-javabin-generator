@@ -13,63 +13,195 @@ import java.util.function.BiConsumer;
  * Optimized fbin reader using memory-mapped I/O and direct buffers
  */
 public class OptimizedReader {
-    
+
+    /**
+     * {@link MappedByteBuffer} capacity is limited to {@link Integer#MAX_VALUE} bytes, so each
+     * {@link FileChannel#map} call must stay within this size. Large batches (e.g. 1M × 768-dim
+     * floats) exceed that limit unless we map multiple contiguous windows.
+     */
+    private static final long MAX_MAP_BYTES = Integer.MAX_VALUE;
+
     // Use larger buffer size for bulk reading - optimized for modern hardware
     private static final int BUFFER_SIZE = 256 * 1024; // 256KB buffer for better throughput
     
     /**
      * Ultra-fast streaming using memory-mapped I/O
+     * Supports both .fbin (with 8-byte header) and .fvecs (with per-vector dimension prefix)
+     *
+     * @param startIndex first vector index in the file (after header for .fbin)
+     * @param count number of vectors to read from that index
+     * @param consumer receives each vector and its index within this range (0 .. count-1)
      */
-    public static long streamFvecsRangeMapped(String filePath, int startIndex, int count, BiConsumer<float[], Integer> consumer) {
+    public static long streamFvecsRangeMapped(String filePath, long startIndex, long count, BiConsumer<float[], Long> consumer) {
         long totalBytesRead = 0;
         
         try (RandomAccessFile file = new RandomAccessFile(filePath, "r");
              FileChannel channel = file.getChannel()) {
             
-            // Read header
-            ByteBuffer headerBuffer = ByteBuffer.allocate(8);
-            headerBuffer.order(ByteOrder.LITTLE_ENDIAN);
-            channel.read(headerBuffer);
-            headerBuffer.flip();
+            // Check if it's .fvecs or .fbin format by file extension
+            boolean isFvecs = filePath.endsWith(".fvecs") || filePath.endsWith(".fvecs.gz");
             
-            int totalCount = headerBuffer.getInt();
-            int dimension = headerBuffer.getInt();
-            totalBytesRead += 8;
-            
-            if (dimension <= 0 || dimension > 10000) {
-                return totalBytesRead;
-            }
-            
-            // Calculate the data region to map
-            long startByteOffset = 8 + ((long) startIndex * dimension * 4L);
-            long dataSize = Math.min((long) count * dimension * 4L, 
-                                     file.length() - startByteOffset);
-            
-            // Memory map the required portion of the file with read-ahead hints
-            MappedByteBuffer mappedBuffer = channel.map(
-                FileChannel.MapMode.READ_ONLY, startByteOffset, dataSize);
-            mappedBuffer.order(ByteOrder.LITTLE_ENDIAN);
-            
-            // Set load hint for better performance on large sequential reads
-            if (mappedBuffer.capacity() > 1024 * 1024) { // For buffers > 1MB
-                mappedBuffer.load(); // Hint to OS to pre-load into memory
-            }
-            
-            totalBytesRead += dataSize;
-            
-            // Process vectors directly from mapped memory
-            for (int i = 0; i < count && (startIndex + i) < totalCount; i++) {
-                if (mappedBuffer.remaining() < dimension * 4) {
-                    break;
+            if (isFvecs) {
+                // .fvecs format: each vector has [int dim][float...] format, no global header
+                // Read first vector's dimension to determine vector size
+                ByteBuffer dimBuffer = ByteBuffer.allocate(4);
+                dimBuffer.order(ByteOrder.LITTLE_ENDIAN);
+                channel.read(dimBuffer);
+                dimBuffer.flip();
+                int dimension = dimBuffer.getInt();
+                channel.position(0); // Reset to start
+                totalBytesRead += 4;
+                
+                if (dimension <= 0 || dimension > 10000) {
+                    return totalBytesRead;
                 }
                 
-                // Allocate vector for each iteration (consumer may keep reference)
-                float[] vector = new float[dimension];
-                for (int j = 0; j < dimension; j++) {
-                    vector[j] = mappedBuffer.getFloat();
+                // Each vector is: 4 bytes (dim) + dim * 4 bytes (floats)
+                int vectorSize = 4 + dimension * 4;
+                long vectorsPerMap = Math.max(1L, MAX_MAP_BYTES / vectorSize);
+
+                long fileVectorIndex = startIndex;
+                long vectorsRemaining = count;
+                long outputIndex = 0;
+
+                while (vectorsRemaining > 0) {
+                    long startByteOffset = fileVectorIndex * vectorSize;
+                    if (startByteOffset >= file.length()) {
+                        break;
+                    }
+                    long nThis = Math.min(vectorsRemaining, vectorsPerMap);
+                    long maxVectorsFromFile = (file.length() - startByteOffset + vectorSize - 1) / vectorSize;
+                    nThis = Math.min(nThis, maxVectorsFromFile);
+                    if (nThis <= 0) {
+                        break;
+                    }
+                    long dataSize = nThis * vectorSize;
+                    if (dataSize > MAX_MAP_BYTES) {
+                        nThis = MAX_MAP_BYTES / vectorSize;
+                        dataSize = nThis * vectorSize;
+                    }
+
+                    MappedByteBuffer mappedBuffer = channel.map(
+                        FileChannel.MapMode.READ_ONLY, startByteOffset, dataSize);
+                    mappedBuffer.order(ByteOrder.LITTLE_ENDIAN);
+
+                    if (mappedBuffer.capacity() > 1024 * 1024) {
+                        mappedBuffer.load();
+                    }
+
+                    long consumedThisMap = 0;
+                    for (long i = 0; i < nThis; i++) {
+                        if (mappedBuffer.remaining() < vectorSize) {
+                            break;
+                        }
+
+                        int vecDim = mappedBuffer.getInt();
+                        if (vecDim != dimension) {
+                            System.err.println("Warning: Inconsistent dimension at vector " + (fileVectorIndex + i) + ": " + vecDim + " vs " + dimension);
+                            vectorsRemaining = 0;
+                            break;
+                        }
+
+                        float[] vector = new float[dimension];
+                        for (int j = 0; j < dimension; j++) {
+                            vector[j] = mappedBuffer.getFloat();
+                        }
+
+                        consumer.accept(vector, outputIndex);
+                        outputIndex++;
+                        consumedThisMap++;
+                    }
+
+                    totalBytesRead += consumedThisMap * vectorSize;
+                    if (consumedThisMap == 0) {
+                        break;
+                    }
+                    fileVectorIndex += consumedThisMap;
+                    vectorsRemaining -= consumedThisMap;
                 }
                 
-                consumer.accept(vector, i);
+            } else {
+                // .fbin format: has 8-byte header [int count][int dimension]
+                ByteBuffer headerBuffer = ByteBuffer.allocate(8);
+                headerBuffer.order(ByteOrder.LITTLE_ENDIAN);
+                channel.read(headerBuffer);
+                headerBuffer.flip();
+                
+                int totalCount = headerBuffer.getInt();
+                int dimension = headerBuffer.getInt();
+                long totalCountL = totalCount;
+                totalBytesRead += 8;
+                
+                if (dimension <= 0 || dimension > 10000) {
+                    return totalBytesRead;
+                }
+
+                long bytesPerVector = (long) dimension * 4L;
+                long vectorsPerMap = Math.max(1L, MAX_MAP_BYTES / bytesPerVector);
+
+                long fileVectorIndex = startIndex;
+                long vectorsRemaining = count;
+                long outputIndex = 0;
+
+                while (vectorsRemaining > 0) {
+                    long availableInFile = Math.max(0L, totalCountL - fileVectorIndex);
+                    long nThis = Math.min(vectorsRemaining, vectorsPerMap);
+                    nThis = Math.min(nThis, availableInFile);
+                    if (nThis <= 0) {
+                        break;
+                    }
+
+                    long chunkBytes = nThis * bytesPerVector;
+                    if (chunkBytes > MAX_MAP_BYTES) {
+                        nThis = MAX_MAP_BYTES / bytesPerVector;
+                        chunkBytes = nThis * bytesPerVector;
+                    }
+
+                    long startByteOffset = 8L + fileVectorIndex * bytesPerVector;
+                    if (startByteOffset >= file.length()) {
+                        break;
+                    }
+                    long maxBytes = file.length() - startByteOffset;
+                    if (chunkBytes > maxBytes) {
+                        nThis = maxBytes / bytesPerVector;
+                        chunkBytes = nThis * bytesPerVector;
+                    }
+                    if (nThis <= 0) {
+                        break;
+                    }
+
+                    MappedByteBuffer mappedBuffer = channel.map(
+                        FileChannel.MapMode.READ_ONLY, startByteOffset, chunkBytes);
+                    mappedBuffer.order(ByteOrder.LITTLE_ENDIAN);
+
+                    if (mappedBuffer.capacity() > 1024 * 1024) {
+                        mappedBuffer.load();
+                    }
+
+                    int rowBytes = dimension * 4;
+                    long consumedThisMap = 0;
+                    for (long i = 0; i < nThis; i++) {
+                        if (mappedBuffer.remaining() < rowBytes) {
+                            break;
+                        }
+
+                        float[] vector = new float[dimension];
+                        for (int j = 0; j < dimension; j++) {
+                            vector[j] = mappedBuffer.getFloat();
+                        }
+
+                        consumer.accept(vector, outputIndex);
+                        outputIndex++;
+                        consumedThisMap++;
+                    }
+
+                    totalBytesRead += consumedThisMap * rowBytes;
+                    if (consumedThisMap == 0) {
+                        break;
+                    }
+                    fileVectorIndex += consumedThisMap;
+                    vectorsRemaining -= consumedThisMap;
+                }
             }
             
         } catch (Exception e) {

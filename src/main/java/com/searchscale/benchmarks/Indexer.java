@@ -12,8 +12,6 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -29,7 +27,6 @@ import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.function.BiConsumer;
 import java.util.zip.GZIPInputStream;
 
 import org.apache.solr.common.MapWriter;
@@ -66,18 +63,18 @@ public class Indexer {
   public static class Params {
 
     public final int threads;
-    public final int totalVectors;
+    public final long totalVectors;
 
     public final String solrUrl;
     public final String dataFile;
     public final String queryFile;
     public final String testColl;
-    public final int batchSize;
+    public final long batchSize;
     public final int queryCount;
     public final boolean runQuery;
     public final String outputDir;
 
-    public final int docsCount;
+    public final long docsCount;
     public final boolean overwrite;
     public final boolean legacy;
 
@@ -96,12 +93,12 @@ public class Indexer {
         threads = Integer.parseInt(threadsParam);
       }
       
-      totalVectors = Integer.parseInt(p.getOrDefault("total_vectors", "0"));
+      totalVectors = Long.parseLong(p.getOrDefault("total_vectors", "0"));
       solrUrl = p.getOrDefault("solr_url", "http://localhost:8983/solr");
       dataFile = p.get("data_file");
       testColl = p.getOrDefault("test_coll", "test");
-      batchSize = Integer.parseInt(p.getOrDefault("batch_size", "1000"));
-      docsCount = Integer.parseInt(p.getOrDefault("docs_count", "10000"));
+      batchSize = Long.parseLong(p.getOrDefault("batch_size", "1000"));
+      docsCount = Long.parseLong(p.getOrDefault("docs_count", "10000"));
       queryFile = p.get("query_file");
       outputDir = p.get("output_dir");
 
@@ -120,6 +117,10 @@ public class Indexer {
     Params p = new Params(args);
     long docsCount = p.docsCount;
     long batchSz = p.batchSize;
+    if (docsCount < 0 || batchSz < 0) {
+      System.err.println("Error: docs_count and batch_size must be non-negative");
+      System.exit(1);
+    }
     System.out.println(p.p.toString());
     if (batchSz > docsCount)
       batchSz = docsCount;
@@ -158,9 +159,9 @@ public class Indexer {
       try (InputStream in = new GZIPInputStream(new FileInputStream(p.dataFile))) {
         BufferedReader br = new BufferedReader(new InputStreamReader(in));
         String header = br.readLine();
-        int count = 0;
-        for (int i = 0;; i++) {
-          String name = Paths.get(p.outputDir, "batch." + i).toString();
+        long count = 0;
+        for (long batchFileIndex = 0;; batchFileIndex++) {
+          String name = Paths.get(p.outputDir, "batch." + batchFileIndex).toString();
           try (FileOutputStream os = new FileOutputStream(name)) {
             JavaBinCodec codec = new J(os);
             if (!writeBatch(batchSz, br, codec, p.legacy))
@@ -199,13 +200,13 @@ public class Indexer {
   private static void processFvecFileSingleThreaded(Params p, long docsCount, long batchSz) throws Exception {
     System.out.println("Using optimized single-threaded processing");
     
-    int totalBatches = (int) Math.ceil((double) docsCount / batchSz);
+    long totalBatches = (long) Math.ceil((double) docsCount / batchSz);
     long totalBytesRead = 0;
     
-    for (int batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
+    for (long batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
       final long startIndex = batchIndex * batchSz;
       final long endIndex = Math.min(startIndex + batchSz, docsCount);
-      final int batchSize = (int) (endIndex - startIndex);
+      final long batchSize = endIndex - startIndex;
       
       long bytesRead = processBatch(p, batchIndex, startIndex, batchSize);
       totalBytesRead += bytesRead;
@@ -221,7 +222,7 @@ public class Indexer {
   private static void processFvecFileMultiThreaded(Params p, long docsCount, long batchSz) throws Exception {
     System.out.println("Using optimized multi-threaded processing with " + p.threads + " threads");
     
-    int totalBatches = (int) Math.ceil((double) docsCount / batchSz);
+    long totalBatches = (long) Math.ceil((double) docsCount / batchSz);
     
     // Choose optimal approach based on dataset size
     boolean isLargeDataset = docsCount > 1_000_000;
@@ -237,7 +238,7 @@ public class Indexer {
   }
   
   // Optimized processing for large datasets or high thread counts
-  private static void processLargeDatasetMultiThreaded(Params p, long docsCount, long batchSz, int totalBatches) throws Exception {
+  private static void processLargeDatasetMultiThreaded(Params p, long docsCount, long batchSz, long totalBatches) throws Exception {
     ExecutorService executor = Executors.newFixedThreadPool(p.threads);
     AtomicInteger completedBatches = new AtomicInteger(0);
     AtomicLong totalBytesRead = new AtomicLong(0);
@@ -245,10 +246,10 @@ public class Indexer {
     
     try {
       // Submit batch processing tasks directly
-      for (int batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
-        final int finalBatchIndex = batchIndex;
+      for (long batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
+        final long finalBatchIndex = batchIndex;
         final long startIndex = batchIndex * batchSz;
-        final int batchSize = (int) Math.min(batchSz, docsCount - startIndex);
+        final long batchSize = Math.min(batchSz, docsCount - startIndex);
         
         Future<Long> future = executor.submit(() -> {
           try {
@@ -256,8 +257,8 @@ public class Indexer {
             totalBytesRead.addAndGet(bytesRead);
             
             int completed = completedBatches.incrementAndGet();
-            System.out.println("Completed batch " + finalBatchIndex + " (" + completed + "/" + totalBatches + 
-                             ") - Total processed: " + (completed * batchSz));
+            System.out.println(
+                "Completed batch " + finalBatchIndex + " (" + completed + "/" + totalBatches + ")");
             return bytesRead;
           } catch (Exception e) {
             System.err.println("Error processing batch " + finalBatchIndex + ": " + e.getMessage());
@@ -284,12 +285,12 @@ public class Indexer {
   }
   
   // Optimized processing for smaller datasets with aggressive optimizations
-  private static void processSmallDatasetMultiThreaded(Params p, long docsCount, long batchSz, int totalBatches) throws Exception {
+  private static void processSmallDatasetMultiThreaded(Params p, long docsCount, long batchSz, long totalBatches) throws Exception {
     // Use ForkJoinPool for better work distribution on smaller datasets
     ForkJoinPool pool = new ForkJoinPool(p.threads);
     
-    ConcurrentLinkedQueue<Integer> workQueue = new ConcurrentLinkedQueue<>();
-    for (int i = 0; i < totalBatches; i++) {
+    ConcurrentLinkedQueue<Long> workQueue = new ConcurrentLinkedQueue<>();
+    for (long i = 0; i < totalBatches; i++) {
       workQueue.offer(i);
     }
     
@@ -302,18 +303,18 @@ public class Indexer {
       // Submit worker tasks with work-stealing
       for (int t = 0; t < p.threads; t++) {
         futures.add(pool.submit(() -> {
-          Integer batchIndex;
+          Long batchIndex;
           while ((batchIndex = workQueue.poll()) != null) {
             try {
               long startIndex = batchIndex * batchSz;
-              int batchSize = (int) Math.min(batchSz, docsCount - startIndex);
+              long batchSize = Math.min(batchSz, docsCount - startIndex);
               
               long bytesRead = processBatch(p, batchIndex, startIndex, batchSize);
               totalBytesRead.addAndGet(bytesRead);
               
               int completed = completedBatches.incrementAndGet();
-              System.out.println("Completed batch " + batchIndex + " (" + completed + "/" + totalBatches + 
-                               ") - Total processed: " + (completed * batchSz));
+              System.out.println(
+                  "Completed batch " + batchIndex + " (" + completed + "/" + totalBatches + ")");
             } catch (Exception e) {
               System.err.println("Error processing batch " + batchIndex + ": " + e.getMessage());
               e.printStackTrace();
@@ -336,64 +337,68 @@ public class Indexer {
     }
   }
 
-  private static long processBatch(Params p, int batchIndex, long startIndex, int batchSize) throws Exception {
+  private static long processBatch(Params p, long batchIndex, long startIndex, long batchSize) throws Exception {
     String name = Paths.get(p.outputDir, "batch." + batchIndex).toString();
-    
-    // Use buffered output stream for better I/O performance
+
     try (FileOutputStream fos = new FileOutputStream(name);
          java.io.BufferedOutputStream bos = new java.io.BufferedOutputStream(fos, 64 * 1024)) {
       
       JavaBinCodec codec = new J(bos);
       codec.writeTag(ITERATOR);
-      
-      // Pre-allocate reusable list with estimated capacity
-      List<Float> reusableFloatList = new ArrayList<>(1024); // Will grow as needed
-      
-      // Use optimized memory-mapped reading for best performance
-      long bytesRead = OptimizedReader.streamFvecsRangeMapped(p.dataFile, (int) startIndex, batchSize, (vector, index) -> {
-        try {
-          final int docId = (int) (startIndex + index);
-          final float[] vectorData = vector;
-          
-          if (p.legacy){
-            reusableFloatList.clear();
-            if (reusableFloatList instanceof ArrayList && vectorData.length > ((ArrayList<Float>) reusableFloatList).size()){
-              ((ArrayList<Float>) reusableFloatList).ensureCapacity(vectorData.length);
-            }
-            for (float f : vectorData){
-              reusableFloatList.add(f);
-            }
-            MapWriter d = ew -> {
-              ew.put("id", String.valueOf(docId));
-              ew.put("article_vector", reusableFloatList);
-            };
-            codec.writeMap(d);
-          }
-          else{
-            MapWriter d = ew -> {
-              ew.put("id", String.valueOf(docId));
-              ew.put("article_vector", vectorData);
-            };
-            codec.writeMap(d);
-          }
-        } catch (IOException e) {
-          throw new RuntimeException("Error writing vector to JavaBin", e);
-        }
-      });
-      
+
+      List<Float> reusableFloatList = new ArrayList<>(1024);
+
+      long bytesRead =
+          OptimizedReader.streamFvecsRangeMapped(
+              p.dataFile,
+              startIndex,
+              batchSize,
+              (vector, index) -> {
+                try {
+                  long docId = startIndex + index;
+                  float[] vectorData = vector;
+
+                  if (p.legacy) {
+                    reusableFloatList.clear();
+                    if (reusableFloatList instanceof ArrayList
+                        && vectorData.length > ((ArrayList<Float>) reusableFloatList).size()) {
+                      ((ArrayList<Float>) reusableFloatList).ensureCapacity(vectorData.length);
+                    }
+                    for (float f : vectorData) {
+                      reusableFloatList.add(f);
+                    }
+                    MapWriter d =
+                        ew -> {
+                          ew.put("id", String.valueOf(docId));
+                          ew.put("article_vector", reusableFloatList);
+                        };
+                    codec.writeMap(d);
+                  } else {
+                    MapWriter d =
+                        ew -> {
+                          ew.put("id", String.valueOf(docId));
+                          ew.put("article_vector", vectorData);
+                        };
+                    codec.writeMap(d);
+                  }
+                } catch (IOException e) {
+                  throw new RuntimeException("Error writing vector to JavaBin", e);
+                }
+              });
+
       codec.writeTag(END);
       codec.close();
       System.out.println(name);
-      
+
       return bytesRead;
     }
   }
 
 
-  private static boolean writeBatch(long docsCount, BufferedReader br, JavaBinCodec codec, boolean legacy)
+  private static boolean writeBatch(long batchSz, BufferedReader br, JavaBinCodec codec, boolean legacy)
       throws IOException {
     codec.writeTag(ITERATOR);
-    int count = 0;
+    long count = 0;
     for (;;) {
       String line = br.readLine();
       if (line == null) {
@@ -406,7 +411,7 @@ public class Indexer {
         codec.writeMap(d);
 
         count++;
-        if (count >= docsCount)
+        if (count >= batchSz)
           break;
       } catch (Exception e) {
         // invalid doc
